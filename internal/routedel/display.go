@@ -3,7 +3,7 @@ package routedel
 // File: internal/routedel/display.go
 // Author: Hadi Cahyadi <cumulus13@gmail.com>
 // Date: 2026-10-26
-// Description: Rich-styled ANSI display and live monitor.
+// Description: Smooth flicker-free Rich-styled ANSI display and live monitor.
 // License: MIT
 
 import (
@@ -158,6 +158,36 @@ func RenderMonitorLayout(routes Routes, lastUpdate string, interval float64, nTa
 	return b.String()
 }
 
+// smoothFrame writes a single buffered ANSI frame using cursor-home + per-line clear
+// instead of full-screen erase (`\x1b[2J`), eliminating scrollback jump and flicker.
+func smoothFrame(content string, prevLines int) int {
+	norm := strings.ReplaceAll(content, "\r\n", "\n")
+	lines := strings.Split(norm, "\n")
+
+	var out strings.Builder
+	// Hide cursor during frame draw, move cursor to home (1,1), clear-to-EOL per line
+	out.WriteString("\x1b[?25l\x1b[H")
+	for i, ln := range lines {
+		if i > 0 {
+			out.WriteString("\n")
+		}
+		out.WriteString("\x1b[2K")
+		out.WriteString(ln)
+	}
+	// Erase any leftover lines from a taller previous frame
+	for i := len(lines); i < prevLines; i++ {
+		out.WriteString("\n\x1b[2K")
+	}
+	// Move cursor back up if we cleared extra trailing lines, then show cursor
+	if len(lines) < prevLines {
+		out.WriteString(fmt.Sprintf("\x1b[%dA\r", prevLines-len(lines)))
+	}
+	out.WriteString("\x1b[?25h")
+
+	_, _ = os.Stdout.Write([]byte(out.String()))
+	return len(lines)
+}
+
 func MonitorRoutes(interval float64, notifier *Notifier) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
@@ -168,7 +198,10 @@ func MonitorRoutes(interval float64, notifier *Notifier) {
 	}
 	notifier.Send(fmt.Sprintf("Monitor started (%d routes)", len(prev)), "info", false, "")
 
+	var prevLineCount int
 	defer func() {
+		// Ensure cursor is always restored on exit
+		_, _ = os.Stdout.Write([]byte("\x1b[?25h\n"))
 		notifier.Send("Monitor stopped", "info", true, "")
 		fmt.Println(styleStdout(ansiGreen, "Route monitoring stopped."))
 	}()
@@ -178,10 +211,7 @@ func MonitorRoutes(interval float64, notifier *Notifier) {
 		dur = 2 * time.Second
 	}
 
-	for {
-		if ctx.Err() != nil {
-			return
-		}
+	renderOnce := func() {
 		routes := GetRoutes()
 		cur := make(map[RouteKey]Route)
 		for _, e := range routes {
@@ -196,13 +226,21 @@ func MonitorRoutes(interval float64, notifier *Notifier) {
 			notifier.Send("Routing table changed:\n"+strings.Join(lines, "\n"), level, false, "")
 			prev = cur
 		}
-		fmt.Print("\x1b[2J\x1b[H")
-		fmt.Println(RenderMonitorLayout(routes, time.Now().Format("15:04:05"), interval, len(notifier.Targets)))
+		frame := RenderMonitorLayout(routes, time.Now().Format("15:04:05.000"), interval, len(notifier.Targets))
+		prevLineCount = smoothFrame(frame, prevLineCount)
+	}
 
+	renderOnce()
+
+	ticker := time.NewTicker(dur)
+	defer ticker.Stop()
+
+	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(dur):
+		case <-ticker.C:
+			renderOnce()
 		}
 	}
 }
